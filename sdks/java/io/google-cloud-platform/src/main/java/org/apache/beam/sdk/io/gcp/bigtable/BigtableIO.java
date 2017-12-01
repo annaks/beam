@@ -212,6 +212,21 @@ public class BigtableIO {
   }
 
   /**
+   * Creates an uninitialized {@link BigtableIO.BulkWrite}. Before use, the {@code BulkWrite} must be
+   * initialized with a
+   * {@link BigtableIO.Write#withBigtableOptions(BigtableOptions) BigtableOptions} that specifies
+   * the destination Cloud Bigtable instance, and a {@link BigtableIO.BulkWrite#withTableId tableId}
+   * that specifies which table to write.
+   */
+  @Experimental
+  public static BulkWrite bulkWrite() {
+    return new AutoValue_BigtableIO_BulkWrite.Builder()
+        .setTableId("")
+        .setValidate(true)
+        .build();
+  }
+
+  /**
    * A {@link PTransform} that reads from Google Cloud Bigtable. See the class-level Javadoc on
    * {@link BigtableIO} for more information.
    *
@@ -648,6 +663,293 @@ public class BigtableIO {
       @Override
       public void populateDisplayData(DisplayData.Builder builder) {
         builder.delegate(Write.this);
+      }
+
+      ///////////////////////////////////////////////////////////////////////////////
+      private final String tableId;
+      private final SerializableFunction<PipelineOptions, BigtableService> bigtableServiceFactory;
+      private BigtableService.Writer bigtableWriter;
+      private long recordsWritten;
+      private final ConcurrentLinkedQueue<BigtableWriteException> failures;
+
+      /**
+       * If any write has asynchronously failed, fail the bundle with a useful error.
+       */
+      private void checkForFailures() throws IOException {
+        // Note that this function is never called by multiple threads and is the only place that
+        // we remove from failures, so this code is safe.
+        if (failures.isEmpty()) {
+          return;
+        }
+
+        StringBuilder logEntry = new StringBuilder();
+        int i = 0;
+        List<BigtableWriteException> suppressed = Lists.newArrayList();
+        for (; i < 10 && !failures.isEmpty(); ++i) {
+          BigtableWriteException exc = failures.remove();
+          logEntry.append("\n").append(exc.getMessage());
+          if (exc.getCause() != null) {
+            logEntry.append(": ").append(exc.getCause().getMessage());
+          }
+          suppressed.add(exc);
+        }
+        String message =
+            String.format(
+                "At least %d errors occurred writing to Bigtable. First %d errors: %s",
+                i + failures.size(),
+                i,
+                logEntry.toString());
+        LOG.error(message);
+        IOException exception = new IOException(message);
+        for (BigtableWriteException e : suppressed) {
+          exception.addSuppressed(e);
+        }
+        throw exception;
+      }
+
+      private class WriteExceptionCallback implements FutureCallback<MutateRowResponse> {
+        private final KV<ByteString, Iterable<Mutation>> value;
+
+        public WriteExceptionCallback(KV<ByteString, Iterable<Mutation>> value) {
+          this.value = value;
+        }
+
+        @Override
+        public void onFailure(Throwable cause) {
+          failures.add(new BigtableWriteException(value, cause));
+        }
+
+        @Override
+        public void onSuccess(MutateRowResponse produced) {}
+      }
+    }
+  }
+
+
+
+  //////////////////////////////////////////////////////////////////////////////////////////
+  /** BulkWrite **/
+  @AutoValue
+  public abstract static class BulkWrite
+      extends PTransform<PCollection<Iterable<KV<ByteString, Iterable<Mutation>>>>, PDone> {
+
+    /** Returns the table being written to. */
+    @Nullable
+    abstract String getTableId();
+
+    @Nullable
+    abstract BigtableService getBigtableService();
+
+    /** Returns the Google Cloud Bigtable instance being written to, and other parameters. */
+    @Nullable
+    public abstract BigtableOptions getBigtableOptions();
+
+    abstract boolean getValidate();
+
+    abstract Builder toBuilder();
+
+    @AutoValue.Builder
+    abstract static class Builder {
+
+      abstract Builder setTableId(String tableId);
+
+      abstract Builder setBigtableOptions(BigtableOptions options);
+
+      abstract Builder setBigtableService(BigtableService bigtableService);
+
+      abstract Builder setValidate(boolean validate);
+
+      abstract BulkWrite build();
+    }
+
+    /**
+     * Returns a new {@link BigtableIO.BulkWrite} that will write to the Cloud Bigtable instance
+     * indicated by the given options, and using any other specified customizations.
+     *
+     * <p>Does not modify this object.
+     */
+    public BulkWrite withBigtableOptions(BigtableOptions options) {
+      return withBigtableOptions(options.toBuilder());
+    }
+
+    /**
+     * Returns a new {@link BigtableIO.BulkWrite} that will write to the Cloud Bigtable instance
+     * indicated by the given options, and using any other specified customizations.
+     *
+     * <p>Clones the given {@link BigtableOptions} builder so that any further changes
+     * will have no effect on the returned {@link BigtableIO.BulkWrite}.
+     *
+     * <p>Does not modify this object.
+     */
+    public BulkWrite withBigtableOptions(BigtableOptions.Builder optionsBuilder) {
+      checkArgument(optionsBuilder != null, "optionsBuilder can not be null");
+      // TODO: is there a better way to clone a Builder? Want it to be immune from user changes.
+      BigtableOptions options = optionsBuilder.build();
+
+      // Set useBulkApi to true for enabling bulk writes
+      BigtableOptions.Builder clonedBuilder = options.toBuilder()
+          .setBulkOptions(
+              options.getBulkOptions().toBuilder()
+                  .setUseBulkApi(true)
+                  .build())
+          .setUseCachedDataPool(true);
+      BigtableOptions clonedOptions = clonedBuilder.build();
+      return toBuilder().setBigtableOptions(clonedOptions).build();
+    }
+
+    /** Disables validation that the table being written to exists. */
+    public BulkWrite withoutValidation() {
+      return toBuilder().setValidate(false).build();
+    }
+
+    /**
+     * Returns a new {@link BigtableIO.Write} that will write to the specified table.
+     *
+     * <p>Does not modify this object.
+     */
+    public BulkWrite withTableId(String tableId) {
+      checkArgument(tableId != null, "tableId can not be null");
+      return toBuilder().setTableId(tableId).build();
+    }
+
+    @Override
+    public PDone expand(PCollection<Iterable<KV<ByteString, Iterable<Mutation>>>> input) {
+      checkArgument(getBigtableOptions() != null, "withBigtableOptions() is required");
+      checkArgument(getTableId() != null && !getTableId().isEmpty(), "withTableId() is required");
+
+      input.apply(ParDo.of(new BigtableBulkWriterFn(getTableId(),
+                                                new SerializableFunction<PipelineOptions, BigtableService>() {
+                                                  @Override
+                                                  public BigtableService apply(PipelineOptions options) {
+                                                    return getBigtableService(options);
+                                                  }
+                                                })));
+      return PDone.in(input.getPipeline());
+    }
+
+    @Override
+    public void validate(PipelineOptions options) {
+      if (getValidate()) {
+        try {
+          checkArgument(
+              getBigtableService(options).tableExists(getTableId()),
+              "Table %s does not exist",
+              getTableId());
+        } catch (IOException e) {
+          LOG.warn("Error checking whether table {} exists; proceeding.", getTableId(), e);
+        }
+      }
+    }
+
+    /**
+     * Returns a new {@link BigtableIO.BulkWrite} that will write using the given Cloud Bigtable
+     * service implementation.
+     *
+     * <p>This is used for testing.
+     *
+     * <p>Does not modify this object.
+     */
+    BulkWrite withBigtableService(BigtableService bigtableService) {
+      checkArgument(bigtableService != null, "bigtableService can not be null");
+      return toBuilder().setBigtableService(bigtableService).build();
+    }
+
+    @Override
+    public void populateDisplayData(DisplayData.Builder builder) {
+      super.populateDisplayData(builder);
+
+      builder.add(DisplayData.item("tableId", getTableId())
+                      .withLabel("Table ID"));
+
+      if (getBigtableOptions() != null) {
+        builder.add(DisplayData.item("bigtableOptions", getBigtableOptions().toString())
+                        .withLabel("Bigtable Options"));
+      }
+    }
+
+    @Override
+    public String toString() {
+      return MoreObjects.toStringHelper(Write.class)
+          .add("options", getBigtableOptions())
+          .add("tableId", getTableId())
+          .toString();
+    }
+
+    /**
+     * Helper function that either returns the mock Bigtable service supplied by
+     * {@link #withBigtableService} or creates and returns an implementation that talks to
+     * {@code Cloud Bigtable}.
+     *
+     * <p>Also populate the credentials option from {@link GcpOptions#getGcpCredential()} if the
+     * default credentials are being used on {@link BigtableOptions}.
+     */
+    @VisibleForTesting
+    BigtableService getBigtableService(PipelineOptions pipelineOptions) {
+      if (getBigtableService() != null) {
+        return getBigtableService();
+      }
+      BigtableOptions.Builder clonedOptions = getBigtableOptions().toBuilder();
+      clonedOptions.setUserAgent(pipelineOptions.getUserAgent());
+      if (getBigtableOptions().getCredentialOptions()
+              .getCredentialType() == CredentialType.DefaultCredentials) {
+        clonedOptions.setCredentialOptions(
+            CredentialOptions.credential(
+                pipelineOptions.as(GcpOptions.class).getGcpCredential()));
+      }
+      return new BigtableServiceImpl(clonedOptions.build());
+    }
+
+    private class BigtableBulkWriterFn extends DoFn<Iterable<KV<ByteString, Iterable<Mutation>>>, Void> {
+
+      public BigtableBulkWriterFn(String tableId,
+                              SerializableFunction<PipelineOptions, BigtableService> bigtableServiceFactory) {
+        this.tableId = checkNotNull(tableId, "tableId");
+        this.bigtableServiceFactory =
+            checkNotNull(bigtableServiceFactory, "bigtableServiceFactory");
+        this.failures = new ConcurrentLinkedQueue<>();
+      }
+
+      @StartBundle
+      public void startBundle(StartBundleContext c) throws IOException {
+        if (bigtableWriter == null) {
+          bigtableWriter = bigtableServiceFactory.apply(
+              c.getPipelineOptions()).openForWriting(tableId);
+        }
+        recordsWritten = 0;
+      }
+
+      @ProcessElement
+      public void processElement(ProcessContext c) throws Exception {
+        checkForFailures();
+        final Iterable<KV<ByteString, Iterable<Mutation>>> elements = c.element();
+        final Iterator<KV<ByteString, Iterable<Mutation>>> iterator = elements.iterator();
+
+        while (iterator.hasNext()) {
+          final KV<ByteString, Iterable<Mutation>> value = iterator.next();
+          Futures.addCallback(
+              bigtableWriter.writeRecord(value), new WriteExceptionCallback(value));
+          ++recordsWritten;
+        }
+      }
+
+      @FinishBundle
+      public void finishBundle() throws Exception {
+        bigtableWriter.flush();
+        checkForFailures();
+        LOG.info("Wrote {} records", recordsWritten);
+      }
+
+      @Teardown
+      public void tearDown() throws Exception {
+        if (bigtableWriter != null) {
+          bigtableWriter.close();
+          bigtableWriter = null;
+        }
+      }
+
+      @Override
+      public void populateDisplayData(DisplayData.Builder builder) {
+        builder.delegate(BulkWrite.this);
       }
 
       ///////////////////////////////////////////////////////////////////////////////
