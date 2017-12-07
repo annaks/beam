@@ -302,6 +302,7 @@ class FakeJobService implements JobService, Serializable {
       throws InterruptedException, IOException {
     TableReference destination = load.getDestinationTable();
     TableSchema schema = load.getSchema();
+    checkArgument(schema != null, "No schema specified");
     List<ResourceId> sourceFiles = filesForLoadJobs.get(jobRef.getProjectId(), jobRef.getJobId());
     WriteDisposition writeDisposition = WriteDisposition.valueOf(load.getWriteDisposition());
     CreateDisposition createDisposition = CreateDisposition.valueOf(load.getCreateDisposition());
@@ -311,7 +312,14 @@ class FakeJobService implements JobService, Serializable {
       return new JobStatus().setState("FAILED").setErrorResult(new ErrorProto());
     }
     if (existingTable == null) {
-      existingTable = new Table().setTableReference(destination).setSchema(schema);
+      TableReference strippedDestination =
+          destination
+              .clone()
+              .setTableId(BigQueryHelpers.stripPartitionDecorator(destination.getTableId()));
+      existingTable =
+          new Table()
+              .setTableReference(strippedDestination)
+              .setSchema(schema);
       if (load.getTimePartitioning() != null) {
         existingTable = existingTable.setTimePartitioning(load.getTimePartitioning());
       }

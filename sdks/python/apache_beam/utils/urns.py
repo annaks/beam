@@ -44,6 +44,7 @@ COMBINE_PER_KEY_TRANSFORM = "beam:ptransform:combine_per_key:v0.1"
 COMBINE_GROUPED_VALUES_TRANSFORM = "beam:ptransform:combine_grouped_values:v0.1"
 FLATTEN_TRANSFORM = "beam:ptransform:flatten:v0.1"
 READ_TRANSFORM = "beam:ptransform:read:v0.1"
+RESHUFFLE_TRANSFORM = "beam:ptransform:reshuffle:v0.1"
 WINDOW_INTO_TRANSFORM = "beam:ptransform:window_into:v0.1"
 
 PICKLED_SOURCE = "beam:source:pickled_python:v0.1"
@@ -55,7 +56,7 @@ INTERVAL_WINDOW_CODER = "urn:beam:coders:interval_window:0.1"
 ITERABLE_CODER = "urn:beam:coders:stream:0.1"
 KV_CODER = "urn:beam:coders:kv:0.1"
 LENGTH_PREFIX_CODER = "urn:beam:coders:length_prefix:0.1"
-GLOBAL_WINDOW_CODER = "urn:beam:coders:urn:beam:coders:global_window:0.1"
+GLOBAL_WINDOW_CODER = "urn:beam:coders:global_window:0.1"
 WINDOWED_VALUE_CODER = "urn:beam:coders:windowed_value:0.1"
 
 ITERABLE_ACCESS = "urn:beam:sideinput:iterable"
@@ -90,9 +91,9 @@ class RunnerApiFn(object):
 
   @classmethod
   def register_urn(cls, urn, parameter_type, fn=None):
-    """Registeres a urn with a constructor.
+    """Registers a urn with a constructor.
 
-    For example, if 'beam:fn:foo' had paramter type FooPayload, one could
+    For example, if 'beam:fn:foo' had parameter type FooPayload, one could
     write `RunnerApiFn.register_urn('bean:fn:foo', FooPayload, foo_from_proto)`
     where foo_from_proto took as arguments a FooPayload and a PipelineContext.
     This function can also be used as a decorator rather than passing the

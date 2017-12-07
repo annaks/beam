@@ -150,8 +150,8 @@ class common_job_properties {
         extensions {
           commitStatus {
             // This is the name that will show up in the GitHub pull request UI
-            // for this Jenkins project.
-            delegate.context("Jenkins: " + commitStatusContext)
+            // for this Jenkins project. It has a limit of 255 characters.
+            delegate.context(("Jenkins: " + commitStatusContext).take(255))
           }
 
           // Comment messages after build completes.
@@ -265,7 +265,7 @@ class common_job_properties {
         // Install Perfkit benchmark requirements.
         shell('pip install --user -r PerfKitBenchmarker/requirements.txt')
         // Install job requirements for Python SDK.
-        shell('pip install --user -e sdks/python/[gcp,test]')
+        shell('pip install --user -e ' + common_job_properties.checkoutDir + '/sdks/python/[gcp,test]')
         // Launch performance test.
         shell("python PerfKitBenchmarker/pkb.py $pkbArgs")
     }
