@@ -136,16 +136,25 @@ public class BigtableIOTest {
       BigtableIO.read().withInstanceId("instance").withProjectId("project");
   private static BigtableIO.Write defaultWrite =
       BigtableIO.write().withInstanceId("instance").withProjectId("project");
+  private static BigtableIO.BulkWrite defaultBulkWrite =
+      BigtableIO.bulkWrite().withInstanceId("instance").withProjectId("project");
   private Coder<KV<ByteString, Iterable<Mutation>>> bigtableCoder;
   private static final TypeDescriptor<KV<ByteString, Iterable<Mutation>>> BIGTABLE_WRITE_TYPE =
       new TypeDescriptor<KV<ByteString, Iterable<Mutation>>>() {};
 
-  @Before
-  public void setup() throws Exception {
+  private Coder<Iterable<KV<ByteString, Iterable<Mutation>>>> bigtableBulkCoder;
+  private static final TypeDescriptor<Iterable<KV<ByteString, Iterable<Mutation>>>>
+      BIGTABLE_BULK_WRITE_TYPE =
+      new TypeDescriptor<Iterable<KV<ByteString, Iterable<Mutation>>>>() {
+      };
+
+  @Before public void setup() throws Exception {
     service = new FakeBigtableService();
     defaultRead = defaultRead.withBigtableService(service);
     defaultWrite = defaultWrite.withBigtableService(service);
+    defaultBulkWrite = defaultBulkWrite.withBigtableService(service);
     bigtableCoder = p.getCoderRegistry().getCoder(BIGTABLE_WRITE_TYPE);
+    bigtableBulkCoder = p.getCoderRegistry().getCoder(BIGTABLE_BULK_WRITE_TYPE);
   }
 
   private static ByteKey makeByteKey(ByteString key) {
@@ -222,6 +231,19 @@ public class BigtableIOTest {
     assertEquals("project", write.getProjectId());
   }
 
+  @Test public void testBulkWriteBuildsCorrectly() {
+    BigtableIO.BulkWrite write = BigtableIO.bulkWrite().withBigtableOptions(BIGTABLE_OPTIONS)
+        .withTableId("table")
+        .withInstanceId("instance")
+        .withProjectId("project");
+    assertEquals("table", write.getTableId());
+    assertEquals("options_project", write.getBigtableOptions().getProjectId());
+    assertEquals("options_instance", write.getBigtableOptions().getInstanceId());
+    assertEquals("instance", write.getInstanceId());
+    assertEquals("project", write.getProjectId());
+  }
+
+
   @Test
   public void testWriteValidationFailsMissingInstanceId() {
     BigtableIO.Write write = BigtableIO.write().withTableId("table")
@@ -256,7 +278,15 @@ public class BigtableIOTest {
   }
 
   @Test
-  public void testWriteValidationFailsMissingOptionsAndInstanceAndProject() {
+  public void testBulkWriteValidationFailsMissingTable() {
+    BigtableIO.BulkWrite write = BigtableIO.bulkWrite().withBigtableOptions(BIGTABLE_OPTIONS);
+
+    thrown.expect(IllegalArgumentException.class);
+
+    write.expand(null);
+  }
+
+  @Test public void testWriteValidationFailsMissingOptions() {
     BigtableIO.Write write = BigtableIO.write().withTableId("table");
 
     thrown.expect(IllegalArgumentException.class);
@@ -273,6 +303,20 @@ public class BigtableIOTest {
                 .setSetCell(SetCell.newBuilder().setValue(ByteString.copyFromUtf8(value)))
                 .build());
     return KV.of(rowKey, mutations);
+  }
+
+  /** Helper function to make multiple row mutations to be written. */
+  private static Iterable<Iterable<KV<ByteString, Iterable<Mutation>>>> makeBulkWrite(String key1,
+      String key2, String value1, String value2) {
+    ByteString rowKey1 = ByteString.copyFromUtf8(key1);
+    ByteString rowKey2 = ByteString.copyFromUtf8(key2);
+    Iterable<Mutation> mutations1 = ImmutableList.of(Mutation.newBuilder()
+        .setSetCell(SetCell.newBuilder().setValue(ByteString.copyFromUtf8(value1))).build());
+    Iterable<Mutation> mutations2 = ImmutableList.of(Mutation.newBuilder()
+        .setSetCell(SetCell.newBuilder().setValue(ByteString.copyFromUtf8(value2))).build());
+    Iterable<KV<ByteString, Iterable<Mutation>>> bulkMutations = ImmutableList
+        .of(KV.of(rowKey1, mutations1), KV.of(rowKey2, mutations2));
+    return ImmutableList.of(bulkMutations);
   }
 
   /** Helper function to make a single bad row mutation (no set cell). */
@@ -297,10 +341,16 @@ public class BigtableIOTest {
         .withBigtableOptions(options)
         .withTableId("TEST-TABLE")
         .getBigtableService(pipelineOptions);
+    BigtableService bulkWriteService = BigtableIO.bulkWrite()
+        .withBigtableOptions(options)
+        .withTableId("TEST-TABLE")
+        .getBigtableService(pipelineOptions);
     assertEquals(CredentialType.SuppliedCredentials,
         readService.getBigtableOptions().getCredentialOptions().getCredentialType());
     assertEquals(CredentialType.SuppliedCredentials,
         writeService.getBigtableOptions().getCredentialOptions().getCredentialType());
+    assertEquals(CredentialType.SuppliedCredentials,
+        bulkWriteService.getBigtableOptions().getCredentialOptions().getCredentialType());
   }
 
   /** Tests that credentials are not used from PipelineOptions if supplied by BigtableOptions. */
@@ -319,10 +369,16 @@ public class BigtableIOTest {
         .withBigtableOptions(options)
         .withTableId("TEST-TABLE")
         .getBigtableService(pipelineOptions);
+    BigtableService bulkWriteService = BigtableIO.bulkWrite()
+        .withBigtableOptions(options)
+        .withTableId("TEST-TABLE")
+        .getBigtableService(pipelineOptions);
     assertEquals(CredentialType.None,
         readService.getBigtableOptions().getCredentialOptions().getCredentialType());
     assertEquals(CredentialType.None,
         writeService.getBigtableOptions().getCredentialOptions().getCredentialType());
+    assertEquals(CredentialType.None,
+        bulkWriteService.getBigtableOptions().getCredentialOptions().getCredentialType());
   }
 
   /** Tests that when reading from a non-existent table, the read fails. */
@@ -693,6 +749,37 @@ public class BigtableIOTest {
     Map<ByteString, ByteString> rows = service.getTable(table);
     assertEquals(1, rows.size());
     assertEquals(ByteString.copyFromUtf8(value), rows.get(ByteString.copyFromUtf8(key)));
+  }
+
+  /** Tests that a record gets written to the service and messages are logged. */
+  @Test public void testBulkWriting() throws Exception {
+    final String table = "table";
+    final String key1 = "key1";
+    final String key2 = "key2";
+    final String value1 = "value1";
+    final String value2 = "value2";
+
+    service.createTable(table);
+
+//    PCollection<Iterable<KV<ByteString, Iterable<Mutation>>>> a = null;
+//    a.apply(BigtableIO.bulkWrite().withBigtableOptions(BIGTABLE_OPTIONS));
+//    Iterable<Iterable<KV<ByteString, Iterable<Mutation>>>> b =
+    // makeBulkWrite(key1, key2, value1, value2);
+//    Create.of(makeWrite(key1, value2));
+
+    p.apply("single row",
+        Create.of(makeBulkWrite(key1, key2, value1, value2)).withCoder(bigtableBulkCoder))
+        .apply("bulk write", defaultBulkWrite.withTableId(table));
+    p.run();
+
+    logged.verifyInfo("Wrote 2 records");
+
+    assertEquals(1, service.tables.size());
+    assertNotNull(service.getTable(table));
+    Map<ByteString, ByteString> rows = service.getTable(table);
+    assertEquals(2, rows.size());
+    assertEquals(ByteString.copyFromUtf8(value1), rows.get(ByteString.copyFromUtf8(key1)));
+    assertEquals(ByteString.copyFromUtf8(value2), rows.get(ByteString.copyFromUtf8(key2)));
   }
 
   /** Tests that when writing to a non-existent table, the write fails. */
